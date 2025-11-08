@@ -15,19 +15,60 @@ Usage:
 
 import math
 import argparse
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, Dict
 import numpy as np
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 torch.set_float32_matmul_precision("high")
 
 # ------------------------------------
-# K-L Math Components (Same as before)
+# Configuration Constants
 # ------------------------------------
 
-def positional_encoding(T: int, d: int, device) -> torch.Tensor:
+# RAG Configuration
+RAG_INTEGRATION_WEIGHT = 0.1
+RAG_TRIGGER_THRESHOLD = 0.5
+RAG_TOP_K = 3
+
+# Loss Weights
+RECON_LOSS_WEIGHT = 0.1
+REWARD_LOSS_WEIGHT = 0.05
+
+# Memory Management
+CACHE_REFRESH_INTERVAL = 25
+GRADIENT_CLIP_NORM = 1.0
+
+# Numerical Stability
+MIN_TAU = 1e-12
+MIN_NORM_EPSILON = 1e-12
+EIGENVALUE_MIN = 0.0
+
+# ------------------------------------
+# K-L Math Components
+# ------------------------------------
+
+def positional_encoding(T: int, d: int, device: torch.device) -> torch.Tensor:
+    """
+    Generate sinusoidal positional encodings.
+
+    Args:
+        T: Sequence length
+        d: Dimension of encoding
+        device: Target device for tensor
+
+    Returns:
+        Positional encoding tensor of shape (T, d)
+    """
     pos = torch.arange(T, device=device).unsqueeze(1).float()
     div = torch.exp(torch.arange(0, d, 2, device=device).float() * (-math.log(10000.0) / d))
     pe = torch.zeros(T, d, device=device)
@@ -36,25 +77,56 @@ def positional_encoding(T: int, d: int, device) -> torch.Tensor:
     return pe
 
 def _time_kernel(t: torch.Tensor, tau: float, kind: str = "exp") -> torch.Tensor:
+    """
+    Compute time-based kernel matrix.
+
+    Args:
+        t: Time points tensor
+        tau: Kernel bandwidth parameter
+        kind: Kernel type ('exp' or 'gauss')
+
+    Returns:
+        Symmetric kernel matrix
+
+    Raises:
+        ValueError: If kernel type is invalid
+    """
     dt = (t[:, None] - t[None, :]).abs()
-    tau = max(float(tau), 1e-12)
+    tau = max(float(tau), MIN_TAU)
     if kind == "exp":
         K = torch.exp(-dt / tau)
     elif kind == "gauss":
         K = torch.exp(-(dt * dt) / (2.0 * tau * tau))
     else:
-        raise ValueError("kernel must be exp|gauss")
+        raise ValueError(f"kernel must be 'exp' or 'gauss', got '{kind}'")
     return 0.5 * (K + K.T)
 
 def _compute_kl_modes(
-    H_full: torch.Tensor, 
-    t_full: torch.Tensor, 
-    n_components: int, 
-    tau: float, 
+    H_full: torch.Tensor,
+    t_full: torch.Tensor,
+    n_components: int,
+    tau: float,
     kernel: str
 ) -> Optional[torch.Tensor]:
+    """
+    Compute K-L expansion modes from historical hidden states.
+
+    Args:
+        H_full: Historical hidden states of shape (T, d_model)
+        t_full: Timestamps of shape (T,)
+        n_components: Number of K-L components to extract
+        tau: Time kernel bandwidth parameter
+        kernel: Kernel type, either 'exp' or 'gauss'
+
+    Returns:
+        K-L modes of shape (n_components, d_model), or None if computation fails
+
+    Raises:
+        ValueError: If kernel is not 'exp' or 'gauss'
+    """
     T = H_full.shape[0]
     if T < max(n_components + 4, 8):
+        logger.debug(f"Insufficient history length {T} for {n_components} components")
         return None
 
     span = max(float(t_full[-1].item() - t_full[0].item()), 1e-6)
@@ -67,20 +139,22 @@ def _compute_kl_modes(
 
     try:
         evals, evecs = torch.linalg.eigh(K)
-    except Exception:
+    except (torch.linalg.LinAlgError, RuntimeError) as e:
+        logger.warning(f"eigh failed: {e}, falling back to SVD")
         try:
             U, S, _ = torch.linalg.svd(K, full_matrices=False)
             evals, evecs = S, U
-        except Exception:
+        except (torch.linalg.LinAlgError, RuntimeError) as e:
+            logger.error(f"SVD also failed: {e}")
             return None
 
     idx = torch.argsort(evals, descending=True)[:n_components]
-    lams = torch.clamp(evals[idx], min=0.0)
+    lams = torch.clamp(evals[idx], min=EIGENVALUE_MIN)
     phi  = evecs[:, idx]
-    phi  = phi / (phi.norm(dim=0, keepdim=True) + 1e-12)
+    phi  = phi / (phi.norm(dim=0, keepdim=True) + MIN_NORM_EPSILON)
 
     coeffs = (phi.detach().T @ H_full.to(phi.dtype))
-    W = torch.sqrt(lams.detach() + 1e-12)[:, None]
+    W = torch.sqrt(lams.detach() + MIN_NORM_EPSILON)[:, None]
     M = W * coeffs
     return M
 
@@ -89,9 +163,15 @@ class PositionalEncoding(nn.Module):
         super().__init__()
         pe = positional_encoding(max_len, d_model, torch.device('cpu'))
         self.register_buffer('pe', pe)
-    
-    def forward(self, x, offset=0):
+        self.max_len = max_len
+
+    def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
         T = x.shape[0]
+        if offset + T > self.max_len:
+            raise ValueError(
+                f"Sequence length {offset + T} exceeds max_len {self.max_len}. "
+                f"offset={offset}, T={T}"
+            )
         return x + self.pe[offset:offset+T].unsqueeze(1).to(x.device)
 
 # ------------------------------------
@@ -124,48 +204,56 @@ class K_L_RAG(nn.Module):
         # Output projection
         self.out_proj = nn.Linear(d_model, n_tokens * d_model)
         
-    def retrieve(self, query_state: torch.Tensor, top_k: int = 3) -> torch.Tensor:
+    def retrieve(self, query_state: torch.Tensor, top_k: int = None) -> torch.Tensor:
         """
         Retrieve relevant knowledge based on query state.
-        query_state: (B, d_model) or (d_model,)
-        Returns: (n_tokens, B, d_model)
+
+        Args:
+            query_state: Query tensor of shape (B, d_model) or (d_model,)
+            top_k: Number of top knowledge items to retrieve (default: RAG_TOP_K)
+
+        Returns:
+            Retrieved knowledge tokens of shape (n_tokens, B, d_model)
         """
+        if top_k is None:
+            top_k = RAG_TOP_K
+
         if query_state.dim() == 1:
             query_state = query_state.unsqueeze(0)  # (1, d_model)
-        
+
         B = query_state.shape[0]
         device = query_state.device
-        
+
         # Project query
         query = self.query_proj(query_state)  # (B, d_model)
-        
+
         # Compute similarity with knowledge base
         # query: (B, d_model), keys: (K, d_model)
         scores = torch.matmul(query, self.knowledge_keys.T)  # (B, K)
         scores = scores / math.sqrt(self.d_model)
-        
+
         # Get top-k
         top_k = min(top_k, self.knowledge_size)
         topk_scores, topk_indices = torch.topk(scores, k=top_k, dim=-1)  # (B, top_k)
-        
-        # Soft retrieval (weighted average)
+
+        # Soft retrieval (weighted average) - VECTORIZED
         weights = F.softmax(topk_scores, dim=-1)  # (B, top_k)
-        
-        # Gather knowledge
-        retrieved = torch.zeros(B, self.d_model, device=device)
-        for i in range(B):
-            for j in range(top_k):
-                idx = topk_indices[i, j]
-                retrieved[i] += weights[i, j] * self.knowledge_embeddings[idx]
-        
+
+        # Gather knowledge embeddings - VECTORIZED using advanced indexing
+        # topk_indices: (B, top_k) -> gather embeddings: (B, top_k, d_model)
+        gathered_embeddings = self.knowledge_embeddings[topk_indices]  # (B, top_k, d_model)
+
+        # Weighted sum: (B, top_k, 1) * (B, top_k, d_model) -> (B, d_model)
+        retrieved = torch.sum(weights.unsqueeze(-1) * gathered_embeddings, dim=1)
+
         # Project to value
         value = self.value_proj(retrieved)  # (B, d_model)
-        
+
         # Project to tokens
         tokens_flat = self.out_proj(value)  # (B, n_tokens * d_model)
         tokens = tokens_flat.reshape(B, self.n_tokens, self.d_model)  # (B, n_tokens, d_model)
         tokens = tokens.permute(1, 0, 2)  # (n_tokens, B, d_model)
-        
+
         return tokens
 
 # ------------------------------------
@@ -376,31 +464,50 @@ class MambaCore(nn.Module):
 # ------------------------------------
 
 class GlobalHistoryBuffer(nn.Module):
+    """
+    Circular buffer for global history management.
+    Maintains a fixed-size window of historical hidden states and timestamps.
+    """
     def __init__(self, depth: int, d_model: int):
         super().__init__()
         self.depth = depth
         self.d_model = d_model
-        
+
         self.register_buffer("_times", torch.zeros(0, dtype=torch.float32))
         self.register_buffer("_hist",  torch.zeros(0, d_model, dtype=torch.float32))
 
-    def append(self, x_chunk: torch.Tensor, offset_t: int):
+    def append(self, x_chunk: torch.Tensor, offset_t: int) -> None:
+        """
+        Append new chunk to history buffer.
+
+        Args:
+            x_chunk: Input chunk of shape (T, B, d_model)
+            offset_t: Time offset for this chunk
+        """
         H = x_chunk.mean(dim=1).to(torch.float32).detach()
         T = H.shape[0]
-        if T == 0: 
+        if T == 0:
             return
-        
+
         device = H.device
         times = torch.arange(offset_t, offset_t + T, device=device, dtype=torch.float32)
         self._times = torch.cat([self._times.to(device), times], dim=0)
         self._hist  = torch.cat([self._hist.to(device),  H],    dim=0)
-        
+
+        # Trim excess with contiguous memory
         if self._hist.shape[0] > self.depth:
             excess = self._hist.shape[0] - self.depth
-            self._hist = self._hist[excess:].detach()
-            self._times = self._times[excess:].detach()
+            # Use contiguous() to ensure memory efficiency
+            self._hist = self._hist[excess:].contiguous().detach()
+            self._times = self._times[excess:].contiguous().detach()
 
     def get_all(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get all historical data.
+
+        Returns:
+            Tuple of (history, timestamps)
+        """
         return self._hist, self._times
 
 # ------------------------------------
@@ -468,31 +575,51 @@ class K_L_Internal_Memory(nn.Module):
         self._cache = {"M": None, "T_hist": 0}
         self._step_counter.zero_()
 
-    def append_to_history(self, h_t: torch.Tensor, offset_t: int):
+    def append_to_history(self, h_t: torch.Tensor, offset_t: int) -> None:
+        """
+        Append hidden states to internal history buffer.
+
+        Args:
+            h_t: Hidden states of shape (T, B, d_model)
+            offset_t: Time offset for this chunk
+        """
         H = h_t.mean(dim=1).to(torch.float32).detach()
         T = H.shape[0]
-        if T == 0: 
+        if T == 0:
             return
 
         device = H.device
         times = torch.arange(offset_t, offset_t + T, device=device, dtype=torch.float32)
         self._times = torch.cat([self._times.to(device), times], dim=0)
         self._hist  = torch.cat([self._hist.to(device),  H],    dim=0)
-        
+
+        # Trim excess with contiguous memory
         if self._hist.shape[0] > self.max_hist:
             excess = self._hist.shape[0] - self.max_hist
-            self._hist = self._hist[excess:].detach()
-            self._times = self._times[excess:].detach()
+            # Use contiguous() to ensure memory efficiency
+            self._hist = self._hist[excess:].contiguous().detach()
+            self._times = self._times[excess:].contiguous().detach()
+            # Invalidate cache when trimming
             self._cache = {"M": None, "T_hist": 0}
 
     def get_memory_tokens(self, B: int, offset_t: int) -> torch.Tensor:
+        """
+        Get internal memory tokens from distant history.
+
+        Args:
+            B: Batch size
+            offset_t: Current time offset
+
+        Returns:
+            Memory tokens of shape (n_tokens, B, d_model)
+        """
         device = self._hist.device
         self._step_counter[0] += 1
-        
+
         distant_mask = self._times < (offset_t - self.context_window)
         if distant_mask.sum() < max(self.n_components + 4, 8):
             return torch.zeros(self.n_tokens, B, self.d_model, device=device)
-        
+
         H = self._hist[distant_mask]
         t = self._times[distant_mask]
         T_hist = H.shape[0]
@@ -500,7 +627,7 @@ class K_L_Internal_Memory(nn.Module):
         M = None
         if self._cache["T_hist"] == T_hist and not self.training:
             M = self._cache["M"]
-        elif self._step_counter.item() % 25 == 1:
+        elif self._step_counter.item() % CACHE_REFRESH_INTERVAL == 1:
             M = _compute_kl_modes(H, t, n_components=self.n_components, tau=self.tau, kernel="gauss")
             if M is not None and not self.training:
                 self._cache = {"M": M.detach(), "T_hist": T_hist}
@@ -605,23 +732,26 @@ class K_L_Hybrid_Lane(nn.Module):
             trigger_prob = dreamer_out['trigger_rag']  # (B,)
             # During training, use soft gating; during eval, threshold
             if self.training:
-                rag_retrieved = self.kl_rag.retrieve(state_summary, top_k=3)  # (M_rag, B, d_model)
+                rag_retrieved = self.kl_rag.retrieve(state_summary)  # (M_rag, B, d_model)
                 # Soft gate: scale by trigger probability
                 trigger_weight = trigger_prob.view(1, -1, 1)  # (1, B, 1)
                 rag_tokens = rag_retrieved * trigger_weight  # (M_rag, B, d_model)
             else:
-                # Hard threshold during eval
-                should_retrieve = trigger_prob > 0.5
+                # Hard threshold during eval with per-batch masking
+                should_retrieve = trigger_prob > RAG_TRIGGER_THRESHOLD  # (B,)
                 if should_retrieve.any():
-                    rag_retrieved = self.kl_rag.retrieve(state_summary, top_k=3)
-                    rag_tokens = rag_retrieved
-        
+                    # Retrieve for all, but mask the output per batch item
+                    rag_retrieved = self.kl_rag.retrieve(state_summary)  # (M_rag, B, d_model)
+                    # Apply per-batch masking: only apply RAG where triggered
+                    mask = should_retrieve.view(1, -1, 1).float()  # (1, B, 1)
+                    rag_tokens = rag_retrieved * mask  # (M_rag, B, d_model)
+
         # 7. Integrate RAG if triggered
         if rag_tokens is not None:
             # Add RAG tokens to processed hidden states
             # Broadcast RAG across time dimension
             rag_broadcasted = rag_tokens.mean(dim=0, keepdim=True).expand(T, -1, -1)  # (T, B, d_model)
-            h_processed = h_processed + 0.1 * rag_broadcasted  # Scaled addition
+            h_processed = h_processed + RAG_INTEGRATION_WEIGHT * rag_broadcasted  # Scaled addition
         
         # 8. Update history
         self.kl_internal.append_to_history(h_processed.detach(), offset_t)
@@ -696,9 +826,9 @@ class HierarchicalEnsemble(nn.Module):
         final_output = (output_1 + output_2) / 2.0
         
         # 5. Track triggers
-        if dreamer_out_1['trigger_rag'].mean() > 0.5:
+        if dreamer_out_1['trigger_rag'].mean() > RAG_TRIGGER_THRESHOLD:
             self.trigger_count_1 += 1
-        if dreamer_out_2['trigger_rag'].mean() > 0.5:
+        if dreamer_out_2['trigger_rag'].mean() > RAG_TRIGGER_THRESHOLD:
             self.trigger_count_2 += 1
         
         # 6. Return outputs and auxiliary losses
@@ -713,7 +843,28 @@ class HierarchicalEnsemble(nn.Module):
 # Training Loop
 # ------------------------------------
 
-def make_long_noisy_song(T=2000, B=16, F_in=32, F_out=8, device="cpu", seed=0):
+def make_long_noisy_song(
+    T: int = 2000,
+    B: int = 16,
+    F_in: int = 32,
+    F_out: int = 8,
+    device: str = "cpu",
+    seed: int = 0
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Generate synthetic noisy sequence data for training.
+
+    Args:
+        T: Sequence length
+        B: Batch size
+        F_in: Input feature dimension
+        F_out: Output feature dimension
+        device: Device to create tensors on
+        seed: Random seed
+
+    Returns:
+        Tuple of (input_sequence, target_sequence)
+    """
     g = torch.Generator(device=device).manual_seed(seed)
     t = torch.arange(T, device=device).float().view(T, 1, 1)
     freqs = torch.logspace(-1.5, 0.0, F_in // 2, device=device).view(1, 1, -1)
@@ -724,7 +875,34 @@ def make_long_noisy_song(T=2000, B=16, F_in=32, F_out=8, device="cpu", seed=0):
     Y = torch.einsum("tbf,fo->tbo", signal, W)
     return X.to(torch.float32), Y.to(torch.float32)
 
-def train_loop(device, epochs=50, T=2000, B=16, d_model=64, n_ctx=256, lr=1e-3, use_rag=True, knowledge_size=100):
+def train_loop(
+    device: torch.device,
+    epochs: int = 50,
+    T: int = 2000,
+    B: int = 16,
+    d_model: int = 64,
+    n_ctx: int = 256,
+    lr: float = 1e-3,
+    use_rag: bool = True,
+    knowledge_size: int = 100
+) -> HierarchicalEnsemble:
+    """
+    Main training loop for the K-L Prior Ensemble.
+
+    Args:
+        device: Device to train on
+        epochs: Number of training epochs
+        T: Total sequence length
+        B: Batch size
+        d_model: Model dimension
+        n_ctx: Context window size
+        lr: Learning rate
+        use_rag: Whether to enable RAG modules
+        knowledge_size: Size of RAG knowledge base
+
+    Returns:
+        Trained model
+    """
     X, Y = make_long_noisy_song(T=T, B=B, F_in=32, F_out=8, device=device)
     
     model = HierarchicalEnsemble(
@@ -789,12 +967,12 @@ def train_loop(device, epochs=50, T=2000, B=16, d_model=64, n_ctx=256, lr=1e-3, 
             reward_loss_2 = F.mse_loss(aux_losses['dreamer_2']['reward_pred'], reward_target)
             reward_loss = (reward_loss_1 + reward_loss_2) / 2.0
             
-            # Total loss
-            loss = pred_loss + 0.1 * recon_loss + 0.05 * reward_loss
+            # Total loss with weighted auxiliary losses
+            loss = pred_loss + RECON_LOSS_WEIGHT * recon_loss + REWARD_LOSS_WEIGHT * reward_loss
             
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
             opt.step()
 
             total_loss += pred_loss.item()
@@ -854,14 +1032,27 @@ def main():
     ap.add_argument("--knowledge-size", type=int, default=100, help="Size of RAG knowledge base")
     args = ap.parse_args()
 
+    # Validate inputs
+    if args.epochs <= 0:
+        raise ValueError(f"epochs must be positive, got {args.epochs}")
+    if args.ctx <= 0:
+        raise ValueError(f"ctx must be positive, got {args.ctx}")
+    if args.d_model <= 0:
+        raise ValueError(f"d_model must be positive, got {args.d_model}")
+    if args.knowledge_size <= 0:
+        raise ValueError(f"knowledge_size must be positive, got {args.knowledge_size}")
+    if args.lr <= 0:
+        raise ValueError(f"lr must be positive, got {args.lr}")
+
     device = torch.device(args.device)
-    
+    logger.info(f"Starting training with device: {device}")
+
     train_loop(
-        device=device, 
-        epochs=args.epochs, 
+        device=device,
+        epochs=args.epochs,
         B=16,
-        d_model=args.d_model, 
-        n_ctx=args.ctx, 
+        d_model=args.d_model,
+        n_ctx=args.ctx,
         lr=args.lr,
         use_rag=args.use_rag,
         knowledge_size=args.knowledge_size
